@@ -4,7 +4,7 @@ const http  = require("http");
 // ── CONFIG ──────────────────────────────────────────────
 const BOT_TOKEN      = "8769953136:AAHFrooUVd1yx8BxPbJVTJPhthyhW-ptTqY";
 const CHAT_ID        = "5092755750";
-const HELIUS_KEY     = "72099335-bd1f-4fb2-b3b9-74caf6656d3f";
+const HELIUS_KEY     = "947b9439-fd89-44a2-a5c6-844487a27892";
 const MAX_MC         = 50000;
 const MIN_TX_USD     = 10;      // min $10 per transaction
 const MIN_BUYS       = 3;       // min 3 consecutive buys
