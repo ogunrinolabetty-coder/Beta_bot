@@ -168,9 +168,12 @@ async function getTokenData(mint) {
 
 async function scan() {
   try {
+    console.log(`[${new Date().toLocaleTimeString()}] Scanning...`);
     // Fetch recent Solana transactions via Helius
     const url = `https://api.helius.xyz/v0/addresses/TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA/transactions?api-key=${HELIUS_KEY}&limit=100&type=SWAP`;
+    console.log(`[${new Date().toLocaleTimeString()}] Fetching Helius data...`);
     const txs = await get(url);
+    console.log(`[${new Date().toLocaleTimeString()}] Helius response: ${Array.isArray(txs) ? txs.length + ' txs' : JSON.stringify(txs).slice(0, 100)}`);
 
     if (!Array.isArray(txs) || txs.length === 0) return;
 
