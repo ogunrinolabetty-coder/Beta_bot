@@ -4,27 +4,14 @@ const http  = require("http");
 // ── CONFIG ──────────────────────────────────────────────
 const BOT_TOKEN      = "8769953136:AAHFrooUVd1yx8BxPbJVTJPhthyhW-ptTqY";
 const CHAT_ID        = "5092755750";
-const HELIUS_KEY     = "947b9439-fd89-44a2-a5c6-844487a27892";
-const MAX_MC         = 50000;
-const MIN_TX_USD     = 10;      // min $10 per transaction
-const MIN_BUYS       = 3;       // min 3 consecutive buys
-const WINDOW_MS      = 3600000; // 1 hour window
-const INTERVAL_MS    = 30_000;
-
-// Routers to watch
-const WATCHED_ROUTERS = [
-  "junoD9pHBQHsbGgcHU85P9jYDHiRyVHpVgoHoRxTQ6m",  // Jupiter aggregator
-  "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4",  // Jupiter v6
-  "DFlow",
-  "okx",
-  "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P",  // PumpFun AMM
-];
-
+const MIN_MC         = 50000;    // minimum $50k MC
+const MAX_MC         = 1000000;  // maximum $1M MC
+const MIN_AGE_DAYS   = 10;       // minimum 10 days old
+const MIN_PUMP_6H    = 25;       // minimum 25% gain in 6h
+const INTERVAL_MS    = 60_000;   // poll every 60 seconds
 // ────────────────────────────────────────────────────────
 
-// accumulation tracking: walletAddr -> { tokenMint -> [{ time, amount, signature }] }
-const accumulation = {};
-const alerted = new Set();
+const alerted = new Map();
 let lastUpdateId = 0;
 
 function get(url, headers = {}) {
@@ -82,37 +69,43 @@ async function pollCommands() {
       const parts = text.split(/\s+/);
       const cmd = parts[0].toLowerCase();
 
-      if (cmd === "/setmc") {
-        if (parts.length < 2) {
-          await sendTelegram(
-            `ℹ️ <b>How to set max MC:</b>\n\n<code>/setmc &lt;amount&gt;</code>\n\n<b>Example:</b>\n<code>/setmc 50000</code>`,
-            chatId
-          );
-        } else {
-          const val = parseInt(parts[1]);
-          if (isNaN(val) || val <= 0) {
-            await sendTelegram(`⚠️ Invalid amount.\n\n<b>Example:</b> <code>/setmc 50000</code>`, chatId);
-          } else {
-            MAX_MC_CURRENT = val;
-            await sendTelegram(`✅ Max MC updated to <b>$${val.toLocaleString()}</b>`, chatId);
-          }
-        }
-
-      } else if (cmd === "/settings") {
+      if (cmd === "/settings") {
         await sendTelegram(
           `⚙️ <b>Current Settings</b>\n\n` +
-          `• Max MC: <b>$${MAX_MC_CURRENT.toLocaleString()}</b>\n` +
-          `• Min buys: <b>${MIN_BUYS}</b> within 1 hour\n` +
-          `• Min tx size: <b>$${MIN_TX_USD}</b>\n` +
-          `• Chain: <b>Solana</b>\n` +
-          `• Routers: JUP, OKX, dFlow, PumpFun AMM`,
+          `• MC range: <b>$${MIN_MC_CURRENT.toLocaleString()} – $${MAX_MC_CURRENT.toLocaleString()}</b>\n` +
+          `• Min age: <b>${MIN_AGE_CURRENT} days</b>\n` +
+          `• Min 6h pump: <b>${MIN_PUMP_CURRENT}%</b>\n` +
+          `• Chain: <b>Solana only</b>`,
           chatId
         );
-
+      } else if (cmd === "/setmc") {
+        if (parts.length < 3) {
+          await sendTelegram(`ℹ️ <b>Usage:</b> <code>/setmc &lt;min&gt; &lt;max&gt;</code>\n\n<b>Example:</b> <code>/setmc 50000 1000000</code>`, chatId);
+        } else {
+          MIN_MC_CURRENT = parseInt(parts[1]);
+          MAX_MC_CURRENT = parseInt(parts[2]);
+          await sendTelegram(`✅ MC range updated to <b>$${MIN_MC_CURRENT.toLocaleString()} – $${MAX_MC_CURRENT.toLocaleString()}</b>`, chatId);
+        }
+      } else if (cmd === "/setpump") {
+        if (parts.length < 2) {
+          await sendTelegram(`ℹ️ <b>Usage:</b> <code>/setpump &lt;percent&gt;</code>\n\n<b>Example:</b> <code>/setpump 25</code>`, chatId);
+        } else {
+          MIN_PUMP_CURRENT = parseInt(parts[1]);
+          await sendTelegram(`✅ Min 6h pump updated to <b>${MIN_PUMP_CURRENT}%</b>`, chatId);
+        }
+      } else if (cmd === "/setage") {
+        if (parts.length < 2) {
+          await sendTelegram(`ℹ️ <b>Usage:</b> <code>/setage &lt;days&gt;</code>\n\n<b>Example:</b> <code>/setage 10</code>`, chatId);
+        } else {
+          MIN_AGE_CURRENT = parseInt(parts[1]);
+          await sendTelegram(`✅ Min token age updated to <b>${MIN_AGE_CURRENT} days</b>`, chatId);
+        }
       } else if (cmd === "/help") {
         await sendTelegram(
-          `🤖 <b>Accumulation Detector Commands</b>\n\n` +
-          `/setmc &lt;amount&gt; — Set max MC threshold\n` +
+          `🤖 <b>Gradual Mover Detector Commands</b>\n\n` +
+          `/setmc &lt;min&gt; &lt;max&gt; — Set MC range\n` +
+          `/setpump &lt;percent&gt; — Set min 6h pump %\n` +
+          `/setage &lt;days&gt; — Set min token age\n` +
           `/settings — Show current settings\n` +
           `/help — Show this message`,
           chatId
@@ -124,189 +117,116 @@ async function pollCommands() {
   }
 }
 
-let MAX_MC_CURRENT = MAX_MC;
-
-function isWatchedRouter(tx) {
-  const accounts = tx?.accountData?.map(a => a.account) || [];
-  const instructions = tx?.instructions || [];
-  const desc = JSON.stringify(tx).toLowerCase();
-
-  // Check for known router signatures
-  for (const router of WATCHED_ROUTERS) {
-    if (accounts.includes(router)) return true;
-    if (desc.includes(router.toLowerCase())) return true;
-  }
-
-  // Check program IDs in instructions
-  for (const ix of instructions) {
-    if (WATCHED_ROUTERS.includes(ix.programId)) return true;
-  }
-
-  // Check source field
-  const source = (tx?.source || "").toLowerCase();
-  if (source.includes("jupiter") || source.includes("jup")) return true;
-  if (source.includes("okx")) return true;
-  if (source.includes("dflow")) return true;
-  if (source.includes("pump")) return true;
-
-  return false;
-}
-
-async function getTokenData(mint) {
-  try {
-    const res = await get(`https://api.dexscreener.com/latest/dex/tokens/${mint}`);
-    const pairs = res?.pairs;
-    if (!Array.isArray(pairs) || pairs.length === 0) return null;
-    const sol = pairs.filter(p => (p.chainId || "").toLowerCase() === "solana");
-    if (sol.length === 0) return null;
-    sol.sort((a, b) => parseFloat(b.liquidity?.usd || 0) - parseFloat(a.liquidity?.usd || 0));
-    return sol[0];
-  } catch (e) {
-    return null;
-  }
-}
+let MIN_MC_CURRENT   = MIN_MC;
+let MAX_MC_CURRENT   = MAX_MC;
+let MIN_PUMP_CURRENT = MIN_PUMP_6H;
+let MIN_AGE_CURRENT  = MIN_AGE_DAYS;
 
 async function scan() {
   try {
     console.log(`[${new Date().toLocaleTimeString()}] Scanning...`);
-    // Fetch recent Solana transactions via Helius
-    const url = `https://api.helius.xyz/v0/addresses/TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA/transactions?api-key=${HELIUS_KEY}&limit=100&type=SWAP`;
-    console.log(`[${new Date().toLocaleTimeString()}] Fetching Helius data...`);
-    const txs = await get(url);
-    console.log(`[${new Date().toLocaleTimeString()}] Helius response: ${Array.isArray(txs) ? txs.length + ' txs' : JSON.stringify(txs).slice(0, 100)}`);
 
-    if (!Array.isArray(txs) || txs.length === 0) return;
+    // Cast wide net with multiple queries
+    const queries = ["solana", "SOL", "meme", "pump", "dog", "cat"];
+    let allPairs = [];
 
-    const now = Date.now();
+    for (const q of queries) {
+      try {
+        const res = await get(`https://api.dexscreener.com/latest/dex/search?q=${q}`);
+        if (res?.pairs) allPairs.push(...res.pairs);
+        await new Promise(r => setTimeout(r, 200));
+      } catch (e) {}
+    }
 
-    for (const tx of txs) {
-      // Only care about watched routers
-      if (!isWatchedRouter(tx)) continue;
+    // Dedupe by pair address
+    const seen = new Map();
+    for (const pair of allPairs) {
+      if (pair.pairAddress) seen.set(pair.pairAddress, pair);
+    }
+    const pairs = Array.from(seen.values());
 
-      const transfers = tx?.tokenTransfers || [];
-      const timestamp = (tx?.timestamp || 0) * 1000;
-      const signature = tx?.signature || "";
+    // Filter Solana only
+    const solPairs = pairs.filter(p => (p.chainId || "").toLowerCase() === "solana");
 
-      for (const transfer of transfers) {
-        const mint = transfer?.mint;
-        const toWallet = transfer?.toUserAccount;
-        const fromWallet = transfer?.fromUserAccount;
-        const tokenAmount = parseFloat(transfer?.tokenAmount || 0);
+    let matchCount = 0;
 
-        if (!mint || !toWallet) continue;
+    for (const pair of solPairs) {
+      const mcapRaw    = parseFloat(pair.marketCap || 0);
+      const change6h   = parseFloat(pair.priceChange?.h6 || 0);
+      const pairAge    = Date.now() - (pair.pairCreatedAt || 0);
+      const ageDays    = pairAge / (1000 * 60 * 60 * 24);
+      const tokenAddr  = pair.baseToken?.address || "";
+      const pairAddr   = pair.pairAddress || "";
 
-        // Skip stables and SOL
-        if (mint === "So11111111111111111111111111111111111111112") continue;
-        if (mint === "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v") continue;
-        if (mint === "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB") continue;
+      // Apply filters
+      if (mcapRaw < MIN_MC_CURRENT || mcapRaw > MAX_MC_CURRENT) continue;
+      if (change6h < MIN_PUMP_CURRENT) continue;
+      if (ageDays < MIN_AGE_CURRENT) continue;
 
-        // Get approximate USD value from tx nativeTransfers
-        const solSpent = Math.abs(
-          (tx?.nativeTransfers || [])
-            .filter(t => t.fromUserAccount === toWallet)
-            .reduce((sum, t) => sum + (t.amount || 0), 0)
-        ) / 1e9;
-        const usdValue = solSpent * 150; // rough SOL price estimate
+      // Cooldown — 4 hours per token
+      const lastAlert = alerted.get(tokenAddr) || 0;
+      if (Date.now() - lastAlert < 14400000) continue;
+      alerted.set(tokenAddr, Date.now());
 
-        if (usdValue < MIN_TX_USD) continue;
+      matchCount++;
 
-        // Track accumulation per wallet per token
-        if (!accumulation[toWallet]) accumulation[toWallet] = {};
-        if (!accumulation[toWallet][mint]) accumulation[toWallet][mint] = [];
+      const name      = pair.baseToken?.name || "Unknown";
+      const symbol    = pair.baseToken?.symbol || "?";
+      const priceUsd  = parseFloat(pair.priceUsd || 0);
+      const mcap      = `$${Number(mcapRaw).toLocaleString()}`;
+      const liq       = `$${Number(pair.liquidity?.usd || 0).toLocaleString()}`;
+      const change1h  = pair.priceChange?.h1 != null ? `${pair.priceChange.h1 > 0 ? "+" : ""}${parseFloat(pair.priceChange.h1).toFixed(1)}%` : "N/A";
+      const change24h = pair.priceChange?.h24 != null ? `${pair.priceChange.h24 > 0 ? "+" : ""}${parseFloat(pair.priceChange.h24).toFixed(1)}%` : "N/A";
+      const ageStr    = `${Math.floor(ageDays)}d`;
+      const dexUrl    = `https://dexscreener.com/solana/${pairAddr}`;
 
-        const history = accumulation[toWallet][mint];
-
-        // Check if last action was a sell (fromWallet === toWallet means they sent out)
-        // Reset if there was a sell
-        const lastEntry = history[history.length - 1];
-
-        // Add this buy
-        history.push({ time: timestamp, usdValue, signature });
-
-        // Clean entries older than 1 hour
-        const recent = history.filter(e => now - e.time < WINDOW_MS);
-        accumulation[toWallet][mint] = recent;
-
-        // Check if we have MIN_BUYS consecutive buys in window
-        if (recent.length < MIN_BUYS) continue;
-
-        // Check total USD spent
-        const totalUsd = recent.reduce((sum, e) => sum + e.usdValue, 0);
-
-        // Dedupe alert per wallet+token combo
-        const alertKey = `${toWallet}:${mint}`;
-        if (alerted.has(alertKey)) continue;
-
-        // Check MC on DexScreener
-        const pair = await getTokenData(mint);
-        if (!pair) continue;
-
-        const mcapRaw = parseFloat(pair.marketCap || 0);
-        if (mcapRaw === 0 || mcapRaw > MAX_MC_CURRENT) continue;
-
-        alerted.add(alertKey);
-        // Reset after 2 hours so we can re-alert if accumulation continues
-        setTimeout(() => alerted.delete(alertKey), 7200000);
-
-        const name     = pair.baseToken?.name || "Unknown";
-        const symbol   = pair.baseToken?.symbol || "?";
-        const mcap     = `$${Number(mcapRaw).toLocaleString()}`;
-        const liq      = `$${Number(pair.liquidity?.usd || 0).toLocaleString()}`;
-        const priceUsd = parseFloat(pair.priceUsd || 0);
-        const change1h = pair.priceChange?.h1 != null ? `${pair.priceChange.h1 > 0 ? "+" : ""}${parseFloat(pair.priceChange.h1).toFixed(1)}%` : "N/A";
-        const dexUrl   = `https://dexscreener.com/solana/${pair.pairAddress}`;
-        const shortWallet = toWallet.slice(0, 6) + "..." + toWallet.slice(-4);
-
-        const msg =
-`🚨 <b>ACCUMULATION ALERT — SOLANA</b>
-
-👤 Wallet: <code>${toWallet}</code>
-📦 <b>${recent.length} consecutive buys</b> in 1h — no sells
-💸 Total spent: <b>~$${totalUsd.toFixed(2)}</b>
+      const msg =
+`📈 <b>GRADUAL MOVER — SOLANA</b>
 
 🪙 <b>${name}</b> (<b>$${symbol}</b>)
 💰 Market Cap: <b>${mcap}</b>
 💵 Price: <b>$${priceUsd.toFixed(8)}</b>
 💧 Liquidity: <b>${liq}</b>
-📈 1h Change: <b>${change1h}</b>
+🕐 Token Age: <b>${ageStr}</b>
 
-📋 CA: <code>${mint}</code>
+📊 6h Change: <b>+${change6h.toFixed(1)}%</b>
+📈 1h Change: <b>${change1h}</b>
+📈 24h Change: <b>${change24h}</b>
+
+📋 CA: <code>${tokenAddr}</code>
 
 🔗 <a href="${dexUrl}">DexScreener</a>
 
 ⚠️ DYOR — not financial advice.`;
 
-        await sendTelegram(msg);
-        console.log(`[ACCUM] ${shortWallet} bought ${symbol} x${recent.length} | MC: ${mcap} | ~$${totalUsd.toFixed(2)}`);
-        await new Promise(r => setTimeout(r, 500));
-      }
+      await sendTelegram(msg);
+      console.log(`[MOVER] ${symbol} +${change6h.toFixed(1)}% 6h | MC: ${mcap} | Age: ${ageStr}`);
+      await new Promise(r => setTimeout(r, 500));
     }
 
-    console.log(`[${new Date().toLocaleTimeString()}] Scan complete`);
+    console.log(`[${new Date().toLocaleTimeString()}] Done — ${matchCount} alerts fired`);
   } catch (err) {
     console.error("Scan error:", err.message);
   }
 }
 
-// Keep-alive — start FIRST before any API calls
+// Keep-alive
 http.createServer((req, res) => {
   res.writeHead(200);
-  res.end("accumulation detector alive");
+  res.end("gradual mover detector alive");
 }).listen(process.env.PORT || 3000, () => console.log(`Ping server on port ${process.env.PORT || 3000}`));
 
 (async () => {
-  console.log("🔍 Solana Accumulation Detector started");
-  console.log(`   Max MC      : $${MAX_MC_CURRENT.toLocaleString()}`);
-  console.log(`   Min buys    : ${MIN_BUYS} within 1h`);
-  console.log(`   Min tx size : $${MIN_TX_USD}`);
-  console.log(`   Routers     : JUP, OKX, dFlow, PumpFun AMM`);
-  console.log(`   Interval    : ${INTERVAL_MS / 1000}s\n`);
+  console.log("📈 Gradual Mover Detector started");
+  console.log(`   MC range   : $${MIN_MC_CURRENT.toLocaleString()} – $${MAX_MC_CURRENT.toLocaleString()}`);
+  console.log(`   Min age    : ${MIN_AGE_CURRENT} days`);
+  console.log(`   Min 6h pump: ${MIN_PUMP_CURRENT}%`);
+  console.log(`   Interval   : ${INTERVAL_MS / 1000}s\n`);
   await sendTelegram(
-    `✅ <b>Accumulation Detector is live!</b>\n\n` +
-    `Watching Solana for wallets making 3+ consecutive buys on the same token within 1 hour through:\n` +
-    `• Jupiter aggregator\n• OKX router\n• dFlow\n• PumpFun AMM\n\n` +
-    `Filters:\n• Max MC: $${MAX_MC_CURRENT.toLocaleString()}\n• Min tx size: $${MIN_TX_USD}\n• No sells in between\n\n` +
-    `Commands: /setmc /settings /help`
+    `✅ <b>Gradual Mover Detector is live!</b>\n\n` +
+    `Watching Solana for older tokens grinding up steadily.\n\n` +
+    `Filters:\n• MC range: $50k – $1M\n• Min age: 10 days\n• Min 6h pump: 25%\n• Chain: Solana only\n\n` +
+    `Commands: /setmc /setpump /setage /settings /help`
   );
   await scan();
   setInterval(scan, INTERVAL_MS);
