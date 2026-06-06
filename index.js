@@ -148,6 +148,24 @@ async function scan() {
     // Filter Solana only
     const solPairs = pairs.filter(p => (p.chainId || "").toLowerCase() === "solana");
 
+    console.log(`[DEBUG] Total pairs: ${pairs.length} | Solana: ${solPairs.length}`);
+
+    // Log MC distribution
+    const inRange = solPairs.filter(p => {
+      const mc = parseFloat(p.marketCap || 0);
+      return mc >= MIN_MC_CURRENT && mc <= MAX_MC_CURRENT;
+    });
+    console.log(`[DEBUG] In MC range: ${inRange.length}`);
+
+    const withPump = inRange.filter(p => parseFloat(p.priceChange?.h6 || 0) >= MIN_PUMP_CURRENT);
+    console.log(`[DEBUG] With 6h pump: ${withPump.length}`);
+
+    const withAge = withPump.filter(p => {
+      const ageDays = (Date.now() - (p.pairCreatedAt || 0)) / (1000 * 60 * 60 * 24);
+      return ageDays >= MIN_AGE_CURRENT;
+    });
+    console.log(`[DEBUG] With age filter: ${withAge.length}`);
+
     let matchCount = 0;
 
     for (const pair of solPairs) {
